@@ -1,0 +1,15 @@
+# 仮想環境
+.venv/
+
+# 環境変数
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
