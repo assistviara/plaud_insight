@@ -13,3 +13,10 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Google OAuth
+credentials.json
+token.json
+
+# Downloads
+downloads/
