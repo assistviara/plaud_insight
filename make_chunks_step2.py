@@ -3,7 +3,6 @@ import psycopg2
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
-# どこから実行しても .env を拾えるようにする（VSCode事故防止）
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
@@ -19,10 +18,10 @@ PG_PASS = require_env("PG_PASS")
 PG_HOST = os.getenv("PG_HOST", "localhost")
 PG_PORT = int(os.getenv("PG_PORT", "5433"))
 
-CHUNK_SIZE = 1000     # 固定長チャンク
-CHUNK_STRIDE = 800    # 200文字オーバーラップ（1000-800）
-MIN_LEN = 50          # 短すぎるraw_textはスキップ（念のため）
-BATCH = 200           # insertバッチ
+CHUNK_SIZE = 1000
+CHUNK_STRIDE = 800
+MIN_LEN = 50
+BATCH = 200
 
 def connect_pg():
     return psycopg2.connect(
@@ -56,40 +55,51 @@ def bulk_insert(cur, to_insert):
     execute_values(cur, sql, to_insert)
     return len(to_insert)
 
+# def ensure_chunked_hash_column(cur):
+#     cur.execute("""
+#         ALTER TABLE plaud.raw_documents
+#         ADD COLUMN IF NOT EXISTS chunked_hash text;
+#     """)
+
 def main():
     inserted_total = 0
     skipped_short = 0
+    rebuilt_docs = 0
 
     with connect_pg() as conn:
         with conn.cursor() as cur:
-            # chunks未生成のraw_documentsだけ対象にする（強い）
+            # 1回だけ（無ければ追加）
+            # ensure_chunked_hash_column(cur)
+
+            # ✅ chunk未作成 or 内容更新（hash差分）を対象にする
             cur.execute("""
-                SELECT rd.id, rd.raw_text
+                SELECT rd.id, rd.raw_text, rd.content_hash, rd.chunked_hash
                 FROM plaud.raw_documents rd
-                LEFT JOIN plaud.chunks c ON c.raw_document_id = rd.id
-                WHERE c.raw_document_id IS NULL
+                WHERE rd.raw_text IS NOT NULL
+                AND rd.content_hash IS NOT NULL
+                AND length(rd.raw_text) >= %s
+                AND (rd.chunked_hash IS NULL OR rd.chunked_hash <> rd.content_hash)
                 ORDER BY rd.id;
-            """)
+            """, (MIN_LEN,))
             rows = cur.fetchall()
 
             if not rows:
-                print("No new raw_documents to chunk. (already done)")
+                print("No raw_documents to (re)chunk. (already up to date)")
                 return
 
-            for raw_document_id, raw_text in rows:
+            for raw_document_id, raw_text, content_hash, chunked_hash in rows:
                 if raw_text is None or len(raw_text) < MIN_LEN:
                     skipped_short += 1
                     continue
 
+                # ✅ 既にchunked_hashがある＝作り直し対象なので、古いchunkを削除
+                if chunked_hash is not None:
+                    cur.execute("DELETE FROM plaud.chunks WHERE raw_document_id = %s;", (raw_document_id,))
+                    rebuilt_docs += 1
+
                 to_insert = []
                 for chunk_index, start_char, end_char, chunk_text in iter_chunks(raw_text, CHUNK_SIZE, CHUNK_STRIDE):
-                    to_insert.append((
-                        raw_document_id,
-                        chunk_index,
-                        start_char,
-                        end_char,
-                        chunk_text,
-                    ))
+                    to_insert.append((raw_document_id, chunk_index, start_char, end_char, chunk_text))
 
                     if len(to_insert) >= BATCH:
                         inserted_total += bulk_insert(cur, to_insert)
@@ -98,9 +108,18 @@ def main():
                 if to_insert:
                     inserted_total += bulk_insert(cur, to_insert)
 
+                # ✅ chunk完了の印としてchunked_hashを更新
+                cur.execute(
+                    "UPDATE plaud.raw_documents SET chunked_hash = %s WHERE id = %s;",
+                    (content_hash, raw_document_id)
+                )
+
         conn.commit()
 
-    print(f"Inserted chunks: {inserted_total} (skipped_short_docs: {skipped_short})")
+    print(
+        f"Inserted chunks: {inserted_total} "
+        f"(rebuilt_docs: {rebuilt_docs}, skipped_short_docs: {skipped_short})"
+    )
 
 if __name__ == "__main__":
     main()
